@@ -1,59 +1,237 @@
 // Launch script v0.3.0 by James Wienecke 2019
-MAIN().
 
 // Autostage
 DECLARE FUNCTION init_AutoStage {
-	PARAMETER persistant IS TRUE.
-
 	DECLARE FUNCTION autoStage {
+		IF disable_AutoStage {
+			return.
+		}
 		WAIT UNTIL STAGE:READY.
 		STAGE.
-		IF persistant { init_autostage(). }
+
+		GLOBAL stage_engines IS listStageEngines().
+		GLOBAL stage_ISP IS calc_stageISP(stage_engines).
+
+		autoStage_Triggers().
 	}
 
-	// if there exists no potential for thrust in current stage, proceed to stage the vessel.
-	IF SHIP:MAXTHRUST = 0 {
-		autoStage().
+	DECLARE FUNCTION autoStage_Triggers {
+		// if there exists no potential for thrust in current stage, proceed to stage the vessel.
+		IF SHIP:MAXTHRUST = 0 {
+			autoStage().
+		}
+		// create triggers to track various fuel types left in current stage
+		IF STAGE:RESOURCES:CONTAINS(LiquidFuel) {
+			WHEN STAGE:LIQUIDFUEL < 0.1 OR disable_AutoStage THEN {
+				autoStage().
+			}
+		}
+		IF STAGE:RESOURCES:CONTAINS(LqdHydrogen) {
+			WHEN STAGE:LQDHYDROGEN OR disable_AutoStage < 0.1 THEN {
+				autoStage().
+			}
+		}
+		IF STAGE:RESOURCES:CONTAINS(SolidFuel) {
+			WHEN STAGE:SOLIDFUEL OR disable_AutoStage < 0.1 THEN {
+				autoStage().
+			}
+		}
 	}
 
-	// create triggers to track various fuel types left in current stage
-	IF STAGE:RESOURCES:CONTAINS(LiquidFuel) {
-		WHEN STAGE:LIQUIDFUEL < 0.1 THEN {
-			autoStage().
-		}
-	}
-	IF STAGE:RESOURCES:CONTAINS(LqdHydrogen) {
-		WHEN STAGE:LQDHYDROGEN < 0.1 THEN {
-			autoStage().
-		}
-	}
-	IF STAGE:RESOURCES:CONTAINS(SolidFuel) {
-		WHEN STAGE:SOLIDFUEL < 0.1 THEN {
-			autoStage().
-		}
-	}
+	SET disable_AutoStage TO FALSE.
+	autoStage_Triggers().
 }
 
 DECLARE FUNCTION listStageEngines {
-	PARAMETER knownEngines IS LIST().
 	PARAMETER stageNumber IS STAGE:NUMBER.
 	LIST ENGINES IN vesselEngines.
 	SET stageEngines TO list().
 	// compile list of engines active during specified stage
 	FOR _engine IN vesselEngines {
-		IF _engine:STAGE = stageNumber AND NOT knownEngines:CONTAINS(_engine) {
+		IF _engine:STAGE = stageNumber AND NOT stage_engines:CONTAINS(_engine) {
 			stageEngines:ADD(_engine).
-			}
 		}
 	}
 	RETURN stageEngines.
 }
 
+DECLARE FUNCTION calc_stageISP {
+	PARAMETER _engines.
+
+	LOCAL _isp IS 0.	
+	FOR _eng IN _engines {
+		SET _isp TO _isp + (_eng:AVAILABLETHRUSTAT(SHIP:Q) / _eng:ISPAT(SHIP:Q)).
+	}
+	RETURN _isp.
+}
+
+DECLARE FUNCTION calc_TWR {
+	LOCAL _thrust IS SHIP:AVAILABLETHRUSTAT(SHIP:Q).
+	LOCAL _weight IS SHIP:MASS.
+
+	RETURN _thrust / _weight.
+}
+
+DECLARE FUNCTION calc_estBurnLength {
+	// credit and thanks for this formula go to u/gisikw on reddit.com/r/Kos/
+	PARAMETER _dV.
+	PARAMETER _vessel IS SHIP.
+
+	LOCAL initMass_kg IS _vessel:MASS * 1000.
+	LOCAL vesselThrust_kg IS _vessel:AVAILABLETHRUSTAT(_vessel:Q) * 1000.
+	
+	RETURN CONSTANT:g0 * initMass_kg * stage_ISP * (1 - CONSTANT:e^(-_dv / (CONSTANT:g0 * stage_ISP))) / vesselThrust_kg. 
+}
+
 DECLARE FUNCTION gravityTurnAngle {
-	PARAMETER initialPitch.
-	SET groundVector TO UP + SHIP:VELOCITY:SURFACE.
-	WAIT UNTIL groundVector:PITCH < initialPitch.
-	RETURN HEADING(launchCompassDirection, groundVector:PITCH).
+	PARAMETER levelOffAlt IS 42000.
+	PARAMETER AoA_mod IS 0.5.
+	RETURN (1 - (ALTITUDE / levelOffAlt) ^ AoA_mod).
+}
+
+DECLARE FUNCTION calc_visViva {
+	PARAMETER altitude IS SHIP:ALTITUDE.
+	PARAMETER orbitingBody IS SHIP:ORBIT:BODY.
+
+	LOCAL radius IS calc_distanceFromBodyCenter(altitude).
+
+	RETURN SQRT(orbitingBody:MU * ((2 / radius) - (1 / orbitingBody:ORBIT:SEMIMAJORAXIS))).
+}
+
+DECLARE FUNCTION calc_distanceFromBodyCenter {
+	PARAMETER heightAboveSurface IS SHIP:ALTITUDE.
+	PARAMETER planetaryRadius IS SHIP:ORBIT:BODY:RADIUS.
+	RETURN planetaryRadius + heightabovesurface.
+}
+
+DECLARE FUNCTION verticalSpeedPID {
+	SET proportionalVal TO 0.05.
+	SET integralVal TO 0.005.
+	SET derivativeVal TO 0.005.
+	SET vspeedEvaluator TO PIDLOOP(proportionalVal, integralVal, derivativeVal).
+	SET vspeedEvaluator:SETPOINT TO 0.
+	LOCAL _limit IS 10.
+	SET vspeedEvaluator:MAXOUTPUT TO _limit.
+	SET vspeedEvaluator:MINOUTPUT TO -_limit.
+
+	RETURN vspeedEvaluator:UPDATE(TIME:SECONDS, VERTICALSPEED).
+}
+
+
+// flightplans are a data structure (sort of) to enable easy, modular mission planning
+// A flightplan will eventually be represented as a list of delegate functions (procedures) that are executed sequentially
+
+// when a flightplan-based script runs, the flightplan initializes and locks the CPU Vessel's
+// throttle and steering to variables "cooked_throttle" and "cooked_steering". The flightplan's Procedure functions
+// modify these two values to produce the autopilot/assisted steering system.
+
+
+
+DECLARE FUNCTION Flightplan_LaunchToOrbit {
+	PARAMETER goal_apoapsis IS 85000.
+	PARAMETER goal_periapsis IS goal_apoapsis.
+	PARAMETER launchDirection IS 90.
+
+	DECLARE FUNCTION Procedure_Head {
+
+		SET PROCEDURE_PTR TO Procedure_Init@.
+		LOCAL PROCEDURE_COMPLETE IS FALSE.
+
+		UNTIL PROCEDURE_COMPLETE {
+			PROCEDURE_PTR().
+		}
+
+		DECLARE FUNCTION Procedure_Init {
+			SET COOKED_THROTTLE TO 0.
+			LOCK THROTTLE TO COOKED_THROTTLE.
+			SET COOKED_STEERING TO HEADING(launchDirection,90).
+			LOCK STEERING TO COOKED_STEERING.
+
+			SET PROCEDURE_PTR TO Procedure_Liftoff@.
+		}
+
+		DECLARE FUNCTION Procedure_Liftoff {
+			SET COOKED_THROTTLE TO 1.
+			init_AutoStage().
+
+			SET PROCEDURE_PTR TO Procedure_GravityTurn@.
+		}
+
+		DECLARE FUNCTION Procedure_GravityTurn {
+			SET COOKED_STEERING TO HEADING(launchDirection, gravityTurnAngle()).
+
+			// APOAPSIS ABOVE ATMOSPHERE
+			// TBD - calculate and compensate for drag bringing down apo whilst still in atmo
+
+			// APOAPSIS AT GOAL APOAPSIS
+			WHEN APOAPSIS >= goal_apoapsis THEN {
+				SET COOKED_THROTTLE TO 0.
+				SET PROCEDURE_PTR TO Procedure_ChangeOrbitTo@.
+			}
+			
+		}
+
+		DECLARE FUNCTION Procedure_ChangeOrbitTo {
+
+			DECLARE FUNCTION throttleForBurn {
+				SET COOKED_THROTTLE TO 1.
+				WHEN est_burn_time < 0.2 THEN {
+					SET COOKED_THROTTLE TO 0.
+					SET PROCEDURE_PTR TO Procedure_End@.
+				}
+			}
+
+			SET COOKED_STEERING TO PROGRADE.
+			IF ETA:APOAPSIS < ETA:PERIAPSIS { SET nextApsis TO APOAPSIS. } ELSE { SET nextApsis TO PERIAPSIS. }
+			LOCAL goal_velocity IS calc_visViva().
+			LOCAL est_burn_dV IS goal_velocity - VELOCITYAT(SHIP, TIME:SECONDS + ETA:nextApsis).
+			LOCK est_burn_time TO calc_estBurnLength(est_burn_dv).
+
+			WHEN ETA:nextApsis - est_burn_time/2 < 5 THEN {
+				SET COOKED_STEERING TO HEADING(launchDirection, -verticalSpeedPID()).
+				throttleForBurn().
+			}
+		}
+
+		DECLARE FUNCTION Procedure_End {
+			UNLOCK STEERING.
+			UNLOCK THROTTLE.
+			PRINT "COMPLETE?".
+			SET PROCEDURE_COMPLETE TO TRUE.
+		}
+		
+		
+	}
+
+	Procedure_Head().
+
+}
+
+// DECLARE FUNCTION calc_HohmannTransfer_dV {
+// 	// LOCAL v_inject.
+// 	// LOCAL v_insert.
+// 	LOCAL orbitingBody IS KERBIN.
+// 	{
+// 		SQRT(SQRT( (2 * KERBOL)))
+// 	}
+// }
+
+DECLARE FUNCTION PreciseOrbitalSpeed {
+	PARAMETER orbitingBody.
+	PARAMETER givenApoapsis.
+	PARAMETER givenPeriapsis.
+	RETURN SQRT(orbitingBody:MU * ( (2 / (givenApoapsis + orbitingBody:RADIUS) ) - 1 / (givenApoapsis + givenPeriapsis + 2 * orbitingBody:Radius / 2) + orbitingBody:RADIUS)).
+}
+
+
+DECLARE FUNCTION vesselPitch {
+	PARAMETER _vessel IS SHIP.
+	RETURN 90 - VANG(_vessel:UP:VECTOR, _vessel:FACING:FOREVECTOR).
+}
+
+DECLARE FUNCTION surfaceVelocityVector {
+	PARAMETER _vessel IS SHIP.
+	RETURN 90 - VANG(_vessel:UP:VECTOR, _vessel:SRFPROGRADE).
 }
 
 DECLARE FUNCTION lerpAngle {
@@ -65,141 +243,16 @@ DECLARE FUNCTION lerpAngle {
 	return ((TIME:SECONDS - initTime)/(initTime + time_limit)) * tgtAngle + initAngle.
 }
 
+DECLARE FUNCTION calc_accDueToGravity {
+	PARAMETER body_1.
+	PARAMETER body_2.
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-// dynamically set the throttle to a value that locks to maintain a specific TWR
-DECLARE FUNCTION CalcThrustProfile {
-	PARAMETER idealTWR.
-
-	LOCAL LOCK g TO KERBIN:MU / KERBIN:DISTANCE^2.
-	LOCAL LOCK maxTWR TO SHIP:MAXTHRUSTAT(SHIP:DYNAMICPRESSURE) / (SHIP:MASS * g).
-	IF idealTWR > maxTWR { return 1. }
-	LOCAL LOCK idealThrust TO idealTWR * SHIP:MASS * g.
-	LOCAL LOCK cookedThrottle TO idealThrust / SHIP:MAXTHRUSTAT(SHIP:DYNAMICPRESSURE).
-
-	RETURN cookedThrottle.
+	RETURN CONSTANT:G * ((body_1:MASS * body_2:MASS) / calc_distanceFromBodyCenter(body_1:ALTITUDE)).
 }
 
-DECLARE FUNCTION GravityTurn {
-	
-}
+//SET TRACKED_DATA TO LEXICON().
+//TRACKED_DATA:ADD("VERTICAL VELOCITY", SHIP:VERTICALSPEED).
+//TRACKED_DATA:ADD("")
 
-// deprecated pls delete
-// continuously adjust steering towards (relatively arbitrary) ascent angle (currently an algabraeic function of the vessel's altitude)
-DECLARE FUNCTION DeprecatedGravityTurn {
-	SET ascentAngle TO 5.658E-9 * ALT:RADAR^2 - 0.00195543 * ALT:RADAR + 107.067.
-	IF ascentAngle > 90 { SET ascentAngle TO 90. }
-}
-
-// check vessel engines to catch flameouts and automatically stage
-//DECLARE FUNCTION AutoStage {
-//	LIST ENGINES IN engineList.
-//	FOR engine IN engineList {
-//		IF engine:FLAMEOUT {
-//			DoStage().
-//			LIST ENGINES IN engineList.
-//			BREAK.
-//		}
-//	}
-//}
-
-// adjust pitch above horizon by pid-modulated vertical speed factor to maintain altitude while circularizing
-DECLARE FUNCTION ApsisPreservingCircularization {
-	SET proportionalVal TO 0.05.
-	SET integralVal TO 0.005.
-	SET derivativeVal TO 0.005.
-	SET vspeedEvaluator TO PIDLOOP(proportionalVal, integralVal, derivativeVal).
-	SET vspeedEvaluator:SETPOINT TO 0.
-
-	RETURN vspeedEvaluator:UPDATE(TIME:SECONDS, VERTICALSPEED).
-}
-
-DECLARE FUNCTION PreciseOrbitalSpeed {
-	PARAMETER orbitingBody.
-	PARAMETER givenApoapsis.
-	PARAMETER givenPeriapsis.
-	RETURN SQRT(orbitingBody:MU * (2 / (givenApoapsis + orbitingBody:RADIUS) - 1 / (givenApoapsis + givenPeriapsis / 2) + orbitingBody:RADIUS)).
-}
-
-DECLARE FUNCTION CircularizationNode {
-	SET initialVelocity TO PreciseOrbitalSpeed(KERBIN, ALT:APOAPSIS, ALT:PERIAPSIS).
-	SET targetVelovity TO PreciseOrbitalSpeed(KERBIN, targetApoapsis, targetPeriapsis).
-	RETURN NODE(ETA:APOAPSIS, 0, 0, targetVelocity - initialVelocity).
-}
-
-DECLARE FUNCTION ExecuteMNode {
-	PARAMETER mNode.
-	LOCK STEERING TO mNode:BURNVECTOR.
-	SET burnDuration TO mNode:DELTAV / (SHIP:MAXTHRUST / SHIP:MASS).
-	
-}
-	
-DECLARE FUNCTION ExecLaunchManeuver {
-	SET ascentAngle TO 90.
-	LOCK THROTTLE TO CalcThrustProfile(launchTWR).
-	LOCK STEERING TO HEADING(launchCompassDirection, ascentAngle).
-	STAGE.
-	PRINT "Launch! Maneuver parameters: ".
-	PRINT "Target Apoapsis: " + targetApoapsis.
-	PRINT "Target Periapsis: " + targetPeriapsis.
-	PRINT "Launch direction: " + launchCompassDirection.
-	PRINT "Target TWR: " + launchTWR.
-	
-	PRINT "Beginning gravity turn...".
-	UNTIL ALT:APOAPSIS > 70000 {
-		IF VERTICALSPEED < 150 { BREAK. }
-		GravityTurn().
-		WAIT 0.1.
-	}
-	SET ascentAngle TO 5.
-	PRINT "Transatmospheric trajectory established. Continuing burn to bring apoapsis to target suborbital trajectory...".
-	UNTIL ALTITUDE > 70000 AND ALT:APOAPSIS >= targetApoapsis {
-	}
-	LOCK THROTTLE TO 0.
-	PRINT "Target apoapsis aquired. Initializing orbit circularization maneuver...".
-	SET directivePointer TO ExecCircularization@.
-	RETURN true.
-}
-
-DECLARE FUNCTION ExecCircularization {
-	LOCK adjustedPitch TO PROGRADE.
-	LOCK STEERING TO adjustedPitch.
-	WAIT UNTIL ETA:APOAPSIS < 1.
-	PRINT "Circularization burn in progress...".
-	LOCK THROTTLE TO CalcThrustProfile(3).
-
-	UNTIL ALT:PERIAPSIS > targetPeriapsis {
-		SET adjustedPitch TO HEADING(launchCompassDirection, ApsisPreservingCircularization()).
-	}
-	PRINT "Orbit established.".
-	SET directivePointer TO Cleanup@.
-	RETURN false.
-}
-
-DECLARE FUNCTION Cleanup {
-	RETURN false.
-}
-
-DECLARE FUNCTION Main {
-	SET scriptReady TO false.
-	PRINT "Building gui...".
-	runpath("liftoffgui.ks").
-	SET directivePointer TO ExecLaunchManeuver@.
-	init_autoStage().
-	WAIT UNTIL scriptReady = true.
-	UNTIL scriptReady = false {
-		SET scriptReady TO directivePointer:CALL.
-	}
-}
+//CLEARSCREEN.
+//PRINT AT
