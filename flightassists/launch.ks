@@ -1,4 +1,4 @@
-// Launch script v0.3.0 by James Wienecke 2019
+// Launch script v0.3.0 by JW 2019
 
 // Autostage
 DECLARE FUNCTION init_AutoStage {
